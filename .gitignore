@@ -1,0 +1,5 @@
+.wineprefix/
+out/
+repro.exe
+result
+.direnv

@@ -1,0 +1,68 @@
+Subject: [PATCH] winex11: Sync the Win32 visibility when another client withdraws or maps a window.
+
+When another X client unmaps a managed window, handle_state_change adopts
+the unexpected WM_STATE as the desired state, but window_update_client_state
+ignores state changes on invisible windows, so the Win32 side keeps
+WS_VISIBLE. The next SetWindowPos from the application recomputes the
+desired state from the Win32 style and maps the window again, silently
+reverting the external change.
+
+Report the external withdraw (and a later external map) to the Win32 side as
+SWP_HIDEWINDOW / SWP_SHOWWINDOW, the way an external iconify already becomes
+SC_MINIMIZE. Show / hide requests from the Win32 side update the desired
+state first, so they never match.
+---
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -1736,6 +1736,42 @@
+     return 0;
+ }
+ 
++/* Another X client may withdraw or map a managed window behind our back. handle_state_change
++ * then adopts the new WM_STATE as the desired state, but the Win32 side keeps the old visibility
++ * and the next SetWindowPos maps the window again. Sync the Win32 visibility to the host instead,
++ * the way an external iconify becomes SC_MINIMIZE. Our own show / hide requests change the
++ * desired state first, so they never match here. */
++static UINT window_update_client_visibility( struct x11drv_win_data *data )
++{
++    static const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
++    UINT style = NtUserGetWindowLongW( data->hwnd, GWL_STYLE );
++
++    if (!data->managed) return 0; /* unmanaged windows are managed by the Win32 side */
++    if (is_virtual_desktop()) return 0; /* ignore window manager changes in virtual desktop mode */
++
++    if (data->wm_state_serial) return 0; /* another WM_STATE update is pending, wait for it to complete */
++    if (data->net_wm_state_serial) return 0; /* another _NET_WM_STATE update is pending, wait for it to complete */
++    if (data->mwm_hints_serial) return 0; /* another MWM_HINT update is pending, wait for it to complete */
++    if (data->configure_serial) return 0; /* another config update is pending, wait for it to complete */
++
++    /* layered windows are mapped only once their attributes are set, see WindowPosChanged */
++    if ((NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED) && !data->layered) return 0;
++
++    if (data->current_state.wm_state == WithdrawnState && data->desired_state.wm_state == WithdrawnState &&
++        (style & WS_VISIBLE) && !(style & WS_MINIMIZE) && is_window_rect_mapped( &data->rects.window ))
++    {
++        TRACE( "window %p/%lx was withdrawn externally, hiding it\n", data->hwnd, data->whole_window );
++        return SWP_HIDEWINDOW | flags;
++    }
++    if (data->current_state.wm_state == NormalState && data->desired_state.wm_state == NormalState &&
++        !(style & WS_VISIBLE))
++    {
++        TRACE( "window %p/%lx was mapped externally, showing it\n", data->hwnd, data->whole_window );
++        return SWP_SHOWWINDOW | flags;
++    }
++    return 0;
++}
++
+ static UINT window_update_client_config( struct x11drv_win_data *data )
+ {
+     static const UINT fullscreen_mask = (1 << NET_WM_STATE_MAXIMIZED) | (1 << NET_WM_STATE_FULLSCREEN);
+@@ -1832,6 +1868,7 @@
+         if (!data->state_locks++) TRACE( "Locked window %p/%lx state\n", data->hwnd, data->whole_window );
+         *state_cmd = window_update_client_state( data );
+         *swp_flags = window_update_client_config( data );
++        if (!*state_cmd && !*swp_flags) *swp_flags = window_update_client_visibility( data );
+         *rect = window_rect_from_visible( &data->rects, data->current_state.rect );
+         release_win_data( data );
+     }
